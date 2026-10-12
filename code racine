@@ -1,0 +1,1328 @@
+#!/usr/bin/env python3# -*- coding: utf-8 -*-
+"""
+═══════════════════════════════════════════════════════════════════════════
+NEXUS-FOOD v1.0.0
+GitCook.com — GitHub pour les cuisiniers
+Auteur : Aissa Mahammedi (DGK)
+Port : 9984
+═══════════════════════════════════════════════════════════════════════════
+"""
+
+import os
+import sys
+import re
+import json
+import sqlite3
+import hashlib
+import secrets
+import urllib.parse
+import http.server
+import socketserver
+from pathlib import Path
+from datetime import datetime, timedelta
+
+VERSION = "1.0.0"
+AUTEUR = "Aissa Mahammedi (DGK)"
+HOST = "0.0.0.0"
+PORT = 9984
+
+
+def _trouver_base():
+for c in [
+Path.home() / "Documents" / "nexus_food",
+Path.home() / "nexus_food",
+Path("/tmp/nexus_food"),
+Path.cwd() / "nexus_food",
+]:
+try:
+c.mkdir(parents=True, exist_ok=True)
+t = c / ".wt"
+t.write_text("ok")
+t.unlink()
+return c
+except Exception:
+continue
+return Path.cwd()
+
+
+BASE = _trouver_base()
+DB_PATH = BASE / "gitcock.db"
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SCHÉMA
+# ═══════════════════════════════════════════════════════════════════════════
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS users (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+username TEXT UNIQUE NOT NULL,
+email TEXT UNIQUE NOT NULL,
+password_hash TEXT NOT NULL,
+bio TEXT DEFAULT '',
+avatar_emoji TEXT DEFAULT 'CHEF',
+reputation INTEGER DEFAULT 0,
+created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS recipes (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+author_id INTEGER NOT NULL,
+name TEXT NOT NULL,
+slug TEXT UNIQUE NOT NULL,
+description TEXT DEFAULT '',
+version TEXT DEFAULT '1.0',
+difficulty INTEGER DEFAULT 3,
+prep_time INTEGER DEFAULT 30,
+portions INTEGER DEFAULT 4,
+ingredients TEXT DEFAULT '[]',
+steps TEXT DEFAULT '[]',
+tags TEXT DEFAULT '[]',
+stars INTEGER DEFAULT 0,
+forks_count INTEGER DEFAULT 0,
+created_at TEXT NOT NULL,
+updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS comments (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+recipe_id INTEGER NOT NULL,
+author_id INTEGER NOT NULL,
+content TEXT NOT NULL,
+created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS issues (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+recipe_id INTEGER NOT NULL,
+author_id INTEGER NOT NULL,
+title TEXT NOT NULL,
+description TEXT DEFAULT '',
+label TEXT DEFAULT 'bug',
+status TEXT DEFAULT 'open',
+created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pull_requests (
+id INTEGER PRIMARY KEY AUTOINCREMENT,
+recipe_id INTEGER NOT NULL,
+author_id INTEGER NOT NULL,
+title TEXT NOT NULL,
+description TEXT DEFAULT '',
+changes TEXT DEFAULT '',
+status TEXT DEFAULT 'open',
+created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sessions (
+token TEXT PRIMARY KEY,
+user_id INTEGER NOT NULL,
+created_at TEXT NOT NULL,
+expires_at TEXT NOT NULL
+);
+"""
+
+
+def db():
+conn = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
+conn.row_factory = sqlite3.Row
+return conn
+
+
+def init_db():
+conn = db()
+conn.executescript(SCHEMA)
+conn.commit()
+conn.close()
+print(" [OK] DB : " + str(DB_PATH))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AUTH
+# ═══════════════════════════════════════════════════════════════════════════
+def hash_password(password):
+salt = secrets.token_hex(16)
+h = hashlib.sha256((salt + password).encode()).hexdigest()
+return salt + ":" + h
+
+
+def verify_password(password, stored):
+try:
+salt, h = stored.split(":")
+return hashlib.sha256((salt + password).encode()).hexdigest() == h
+except Exception:
+return False
+
+
+def create_session(user_id):
+token = secrets.token_hex(32)
+conn = db()
+expires = (datetime.now() + timedelta(days=30)).isoformat()
+conn.execute(
+"INSERT INTO sessions (token, user_id, created_at, expires_at) VALUES (?,?,?,?)",
+(token, user_id, datetime.now().isoformat(), expires)
+)
+conn.commit()
+conn.close()
+return token
+
+
+def get_user_from_session(token):
+if not token:
+return None
+conn = db()
+row = conn.execute(
+"SELECT u.* FROM users u JOIN sessions s ON s.user_id=u.id "
+"WHERE s.token=? AND s.expires_at > ?",
+(token, datetime.now().isoformat())
+).fetchone()
+conn.close()
+return dict(row) if row else None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UTILITAIRES
+# ═══════════════════════════════════════════════════════════════════════════
+def slugify(text):
+text = text.lower()
+text = re.sub(r"[^a-z0-9]+", "-", text)
+return text.strip("-")
+
+
+def esc(s):
+if s is None:
+return ""
+return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+
+def parse_cookies(header):
+cookies = {}
+if not header:
+return cookies
+for part in header.split(";"):
+if "=" in part:
+k, v = part.split("=", 1)
+cookies[k.strip()] = v.strip()
+return cookies
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DEMO DATA
+# ═══════════════════════════════════════════════════════════════════════════
+def init_demo():
+conn = db()
+n = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+if n > 0:
+conn.close()
+return
+print(" [INFO] Création données de démo...")
+
+users_data = [
+("DGK", "dgk@nexus-food.com", "nexus2026", "Forgeron Suprême. Chips 4nm et sandwichs.", "CHEF"),
+("Redman", "redman@nexus-food.com", "piment2026", "Spécialiste piment. Forkeur fou.", "PIMENT"),
+("ChefMarie", "marie@nexus-food.com", "cuisine2026", "Cuisine française traditionnelle.", "MARIE"),
+("TacosKing", "tacos@nexus-food.com", "tacos2026", "Tacos cosmiques uniquement.", "TACOS"),
+]
+
+user_ids = []
+for username, email, password, bio, avatar in users_data:
+try:
+cur = conn.execute(
+"INSERT INTO users (username, email, password_hash, bio, avatar_emoji, created_at) "
+"VALUES (?,?,?,?,?,?)",
+(username, email, hash_password(password), bio, avatar, datetime.now().isoformat())
+)
+user_ids.append(cur.lastrowid)
+except sqlite3.IntegrityError:
+pass
+conn.commit()
+
+recettes = [
+(user_ids[0], "McCrispy-Redman", "Poulet croustillant qui dépasse du pain.", "4.0", 4, 35, 4,
+[{"nom": "Poulet", "qty": "150g"}, {"nom": "Pain brioché", "qty": "1"},
+{"nom": "Cheddar", "qty": "2 tr."}, {"nom": "Salade", "qty": "1 poignée"},
+{"nom": "Sauce DGK", "qty": "3 c.à.s"}, {"nom": "Piment", "qty": "1 c.à.c"}],
+["Préchauffer four 180C", "Paner le poulet", "Frire 5 min", "Griller pain",
+"Caraméliser oignons 15 min", "Assembler", "Servir sur plateau métal"],
+["burger", "poulet", "croustillant", "epice"], 47, 8),
+
+(user_ids[0], "Nexus-Pizza-Quantique", "Pizza four à bois 400C. Mozzarella di bufala.", "3.0", 5, 90, 2,
+[{"nom": "Farine T00", "qty": "500g"}, {"nom": "Eau tiède", "qty": "325ml"},
+{"nom": "Levure fraîche", "qty": "5g"}, {"nom": "San Marzano", "qty": "400g"},
+{"nom": "Mozzarella", "qty": "250g"}, {"nom": "Basilic", "qty": "10 feuilles"}],
+["Pétrir 10 min", "Repos 24h frigo", "Étaler la pâte", "Tomates écrasées",
+"Mozzarella", "Cuire 90s à 400C", "Basilic frais à la sortie"],
+["pizza", "italien", "four-a-bois"], 32, 4),
+
+(user_ids[1], "Tacos-Cosmique-Piment", "Tacos revisité piment ghost. Niveau 10/10.", "2.0", 5, 25, 3,
+[{"nom": "Tortillas", "qty": "6"}, {"nom": "Boeuf haché", "qty": "400g"},
+{"nom": "Ghost pepper", "qty": "1"}, {"nom": "Oignons rouges", "qty": "2"},
+{"nom": "Coriandre", "qty": "1 bouquet"}, {"nom": "Citron vert", "qty": "2"}],
+["Chauffer tortillas", "Cuire boeuf 8 min", "Ajouter ghost pepper (attention)",
+"Assembler", "Servir immédiatement"],
+["tacos", "mexicain", "piment"], 28, 3),
+
+(user_ids[2], "Boeuf-Bourguignon-DGK", "Boeuf bourguignon traditionnel 3h.", "2.0", 4, 180, 6,
+[{"nom": "Boeuf bourguignon", "qty": "1kg"}, {"nom": "Vin rouge", "qty": "750ml"},
+{"nom": "Carottes", "qty": "3"}, {"nom": "Oignons jaunes", "qty": "2"},
+{"nom": "Lardons", "qty": "200g"}, {"nom": "Champignons", "qty": "300g"}],
+["Revenir lardons 5 min", "Saisir boeuf 10 min", "Ajouter carottes + oignons",
+"Déglacer vin rouge", "Mijoter 3h", "Champignons 30 min avant la fin"],
+["francais", "traditionnel", "mijote"], 89, 12),
+
+(user_ids[3], "Sushi-Quantum-Roll", "Sushi thon rouge, riz vinaigré, nori premium.", "1.0", 5, 60, 2,
+[{"nom": "Riz à sushi", "qty": "500g"}, {"nom": "Vinaigre riz", "qty": "3 c.à.s"},
+{"nom": "Thon rouge", "qty": "300g"}, {"nom": "Nori premium", "qty": "10 feuilles"},
+{"nom": "Wasabi", "qty": "1 c.à.c"}],
+["Cuire riz 20 min", "Assaisonner riz vinaigre", "Préparer thon sashimi",
+"Étaler riz sur nori", "Rouler avec thon", "Découper 8 pièces"],
+["japonais", "sushi", "the"], 156, 22),
+]
+
+recipe_ids = []
+for (aid, name, desc, ver, diff, prep, port, ing, steps, tags, stars, forks) in recettes:
+slug = slugify(name)
+try:
+cur = conn.execute(
+"INSERT INTO recipes (author_id, name, slug, description, version, "
+"difficulty, prep_time, portions, ingredients, steps, tags, "
+"stars, forks_count, created_at, updated_at) "
+"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+(aid, name, slug, desc, ver, diff, prep, port,
+json.dumps(ing, ensure_ascii=False),
+json.dumps(steps, ensure_ascii=False),
+json.dumps(tags, ensure_ascii=False),
+stars, forks, datetime.now().isoformat(), datetime.now().isoformat())
+)
+recipe_ids.append(cur.lastrowid)
+except sqlite3.IntegrityError:
+pass
+conn.commit()
+
+comments = [
+(recipe_ids[0], user_ids[1], "Frérot ce sandwich dépasse, validé !"),
+(recipe_ids[0], user_ids[2], "Attention allergies sésame."),
+(recipe_ids[1], user_ids[0], "Mozzarella di bufala obligatoire."),
+(recipe_ids[2], user_ids[3], "Ghost pepper = danger. Mais j'aime."),
+]
+for rid, uid, content in comments:
+conn.execute(
+"INSERT INTO comments (recipe_id, author_id, content, created_at) VALUES (?,?,?,?)",
+(rid, uid, content, datetime.now().isoformat())
+)
+
+issues = [
+(recipe_ids[0], user_ids[1], "Allergie sésame", "Le pain contient du sésame.", "allergie"),
+(recipe_ids[2], user_ids[0], "Ghost pepper trop intense", "Réduire dosage public.", "bug"),
+]
+for rid, uid, title, desc, label in issues:
+conn.execute(
+"INSERT INTO issues (recipe_id, author_id, title, description, label, created_at) "
+"VALUES (?,?,?,?,?,?)",
+(rid, uid, title, desc, label, datetime.now().isoformat())
+)
+
+prs = [
+(recipe_ids[0], user_ids[1], "feat: ajout piment Redman",
+"Ajout 1 c.à.c cayenne + sriracha.", "+ piment_cayenne: 1 c.à.c", "merged"),
+(recipe_ids[1], user_ids[0], "feat: basilic après cuisson",
+"Basilic post-four pour arômes.", "+ basilic: 10 feuilles", "open"),
+]
+for rid, uid, title, desc, changes, status in prs:
+conn.execute(
+"INSERT INTO pull_requests (recipe_id, author_id, title, description, "
+"changes, status, created_at) VALUES (?,?,?,?,?,?,?)",
+(rid, uid, title, desc, changes, status, datetime.now().isoformat())
+)
+
+conn.commit()
+conn.close()
+print(" [OK] Démo : 4 users, 5 recettes")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CSS
+# ═══════════════════════════════════════════════════════════════════════════
+CSS = """
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+--bg:#0d1117;--bg2:#161b22;--card:#1c2128;--border:#30363d;
+--text:#e6edf3;--dim:#7d8590;--muted:#484f58;
+--or:#c8a45c;--cyan:#00d4ff;--rose:#ff6ec7;--violet:#9d4edd;
+--success:#3fb950;--warn:#d29922;--danger:#f85149;--info:#58a6ff;
+}
+body{background:var(--bg);color:var(--text);
+font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;
+font-size:15px;line-height:1.6;min-height:100vh}
+.topbar{background:var(--bg2);border-bottom:1px solid var(--border);
+padding:14px 24px;display:flex;justify-content:space-between;align-items:center;
+position:sticky;top:0;z-index:100;flex-wrap:wrap;gap:12px}
+.topbar-left{display:flex;align-items:center;gap:20px;flex-wrap:wrap}
+.logo{font-size:22px;font-weight:900;letter-spacing:-1px;
+background:linear-gradient(135deg,#fff,var(--or),var(--rose));
+-webkit-background-clip:text;-webkit-text-fill-color:transparent;text-decoration:none}
+.nav{display:flex;gap:6px;align-items:center;flex-wrap:wrap}
+.nav a{color:var(--text);text-decoration:none;font-size:14px;
+padding:6px 12px;border-radius:6px;transition:.2s}
+.nav a:hover{background:var(--card);color:var(--or)}
+.nav a.active{background:var(--card);color:var(--or);font-weight:600}
+.user-badge{display:flex;align-items:center;gap:8px;
+color:var(--text);text-decoration:none;font-size:14px}
+.avatar{width:32px;height:32px;border-radius:50%;background:var(--card);
+display:flex;align-items:center;justify-content:center;font-size:12px;
+border:1px solid var(--border);font-weight:700;color:var(--or)}
+.container{max-width:1200px;margin:0 auto;padding:24px}
+.card{background:var(--card);border:1px solid var(--border);
+border-radius:10px;padding:20px;margin-bottom:16px}
+.card h2{color:var(--or);font-size:18px;font-weight:700;margin-bottom:12px}
+.card h3{color:var(--cyan);font-size:15px;font-weight:600;margin:16px 0 8px}
+.btn{display:inline-block;padding:8px 16px;border-radius:6px;
+background:linear-gradient(135deg,var(--or),var(--rose));color:#000;
+text-decoration:none;font-weight:700;font-size:14px;border:none;
+cursor:pointer;transition:.2s;font-family:inherit}
+.btn:hover{transform:translateY(-1px);box-shadow:0 4px 20px rgba(200,164,92,.3)}
+.btn.secondary{background:transparent;color:var(--cyan);border:1px solid var(--cyan)}
+.btn.secondary:hover{background:var(--cyan);color:#000;box-shadow:none}
+.btn.danger{background:var(--danger);color:#fff}
+.btn.small{padding:5px 10px;font-size:12px}
+input,textarea,select{width:100%;padding:10px 12px;background:#000;
+border:1px solid var(--border);color:var(--text);border-radius:6px;
+font-family:inherit;font-size:14px;margin-bottom:12px}
+input:focus,textarea:focus{outline:none;border-color:var(--or)}
+label{display:block;font-size:13px;color:var(--dim);margin-bottom:6px;font-weight:600}
+textarea{min-height:100px;resize:vertical}
+.grid-2{display:grid;grid-template-columns:2fr 1fr;gap:20px}
+@media(max-width:768px){.grid-2{grid-template-columns:1fr}}
+.recipe-card{background:var(--bg2);border:1px solid var(--border);
+border-radius:10px;padding:18px;margin-bottom:12px;
+border-left:3px solid var(--or);transition:.2s}
+.recipe-card:hover{border-color:var(--or);transform:translateX(3px)}
+.recipe-card h3{color:var(--or);font-size:16px;margin-bottom:6px}
+.recipe-card h3 a{color:inherit;text-decoration:none}
+.recipe-card .desc{color:var(--dim);font-size:13px;margin:8px 0}
+.recipe-card .stats{display:flex;gap:16px;color:var(--dim);font-size:12px;margin-top:12px;flex-wrap:wrap}
+.badge{display:inline-block;padding:3px 10px;border-radius:999px;
+font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;margin-right:4px}
+.badge.version{background:rgba(200,164,92,.15);color:var(--or);border:1px solid rgba(200,164,92,.3)}
+.badge.tag{background:rgba(0,212,255,.1);color:var(--cyan);border:1px solid rgba(0,212,255,.3)}
+.badge.success{background:rgba(63,185,80,.15);color:var(--success);border:1px solid rgba(63,185,80,.3)}
+.badge.warn{background:rgba(210,153,34,.15);color:var(--warn);border:1px solid rgba(210,153,34,.3)}
+.badge.danger{background:rgba(248,81,73,.15);color:var(--danger);border:1px solid rgba(248,81,73,.3)}
+.hero{text-align:center;padding:48px 24px;margin-bottom:24px;
+background:linear-gradient(135deg,rgba(200,164,92,.1),rgba(255,110,199,.1));
+border:1px solid var(--border);border-radius:16px}
+.hero h1{font-size:48px;font-weight:900;letter-spacing:-2px;
+background:linear-gradient(135deg,#fff,var(--or),var(--rose));
+background-size:200% auto;-webkit-background-clip:text;
+-webkit-text-fill-color:transparent;margin-bottom:12px}
+.hero p{color:var(--dim);font-size:16px;margin-bottom:8px}
+ol.steps{padding-left:24px}
+ol.steps li{margin:10px 0;padding:8px 0;border-bottom:1px solid var(--border)}
+.ingredients{list-style:none}
+.ingredients li{padding:8px 12px;background:var(--bg);
+border-left:3px solid var(--cyan);margin:6px 0;border-radius:4px;
+display:flex;justify-content:space-between;font-size:14px}
+.ingredients li .qty{color:var(--cyan);font-weight:600;font-family:monospace}
+.comment{padding:14px;background:var(--bg2);border-radius:8px;
+margin:10px 0;border-left:3px solid var(--violet)}
+.comment .author{color:var(--violet);font-weight:700;font-size:13px}
+.comment .date{color:var(--muted);font-size:11px;float:right}
+.comment .content{margin-top:6px}
+.issue{padding:14px;background:var(--bg2);border-radius:8px;
+margin:10px 0;border-left:3px solid var(--danger)}
+.issue.closed{border-left-color:var(--success);opacity:.7}
+.issue .title{color:var(--danger);font-weight:700}
+.issue .label{font-size:11px;padding:2px 8px;border-radius:999px;
+background:rgba(248,81,73,.15);color:var(--danger);margin-left:8px}
+.pr{padding:14px;background:var(--bg2);border-radius:8px;
+margin:10px 0;border-left:3px solid var(--warn)}
+.pr.merged{border-left-color:var(--success);opacity:.7}
+.pr .title{color:var(--warn);font-weight:700}
+.pr .changes{background:#000;padding:10px;border-radius:4px;
+font-family:monospace;font-size:12px;color:var(--success);
+margin-top:8px;white-space:pre-wrap}
+.empty{text-align:center;padding:48px 20px;color:var(--dim)}
+.empty .icon{font-size:48px;margin-bottom:16px}
+footer{text-align:center;padding:32px;color:var(--dim);font-size:13px;
+margin-top:40px;border-top:1px solid var(--border);font-family:monospace}
+footer strong{color:var(--or)}
+.alert{padding:12px 16px;border-radius:8px;margin-bottom:16px;
+font-size:14px;border:1px solid}
+.alert.error{background:rgba(248,81,73,.1);border-color:var(--danger);color:var(--danger)}
+.alert.success{background:rgba(63,185,80,.1);border-color:var(--success);color:var(--success)}
+.alert.info{background:rgba(88,166,255,.1);border-color:var(--info);color:var(--info)}
+.trend{display:flex;align-items:center;gap:12px;padding:12px 0;
+border-bottom:1px solid var(--border)}
+.trend:last-child{border-bottom:none}
+.trend .rank{font-size:24px;font-weight:900;color:var(--or);
+width:40px;font-family:monospace}
+.trend .info{flex:1}
+.trend .info h4{color:var(--text);font-size:14px;margin-bottom:2px}
+.trend .info .stats{color:var(--dim);font-size:12px}
+.trend .score{font-size:18px;font-weight:700;color:var(--success);font-family:monospace}
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# LAYOUT
+# ═══════════════════════════════════════════════════════════════════════════
+def layout(title, content, user=None, active=""):
+if user:
+user_html = (
+'<a href="/profil/' + esc(user["username"]) + '" class="user-badge">'
+'<span class="avatar">' + esc(user["avatar_emoji"]) + '</span>'
+'<span>' + esc(user["username"]) + '</span>'
+'</a>'
+'<a href="/logout" class="btn small secondary">Logout</a>'
+)
+else:
+user_html = (
+'<a href="/login" class="btn small secondary">Login</a>'
+'<a href="/register" class="btn small">Register</a>'
+)
+
+nav_items = [
+("/", "Accueil", "accueil"),
+("/explore", "Explorer", "explore"),
+("/trending", "Tendances", "trending"),
+("/create", "Creer", "create"),
+("/issues", "Issues", "issues"),
+("/pulls", "PR", "pulls"),
+]
+
+nav_html = ""
+for href, label, key in nav_items:
+cls = ' class="active"' if key == active else ""
+nav_html += '<a href="' + href + '"' + cls + '>' + label + '</a>'
+
+return (
+'<!DOCTYPE html><html lang="fr"><head>'
+'<meta charset="UTF-8">'
+'<meta name="viewport" content="width=device-width,initial-scale=1">'
+'<title>' + esc(title) + ' - NEXUS-FOOD</title>'
+'<style>' + CSS + '</style>'
+'</head><body>'
+'<header class="topbar">'
+'<div class="topbar-left">'
+'<a href="/" class="logo">NEXUS-FOOD</a>'
+'<nav class="nav">' + nav_html + '</nav>'
+'</div>'
+'<div style="display:flex;gap:12px;align-items:center">' + user_html + '</div>'
+'</header>'
+'<main class="container">' + content + '</main>'
+'<footer><strong>NEXUS-FOOD v' + VERSION + '</strong><br>'
+'GitCook.com - GitHub pour les cuisiniers<br>'
+'Forgeron : ' + esc(AUTEUR) + ' - Code Nametron 3 Lara<br>'
+'Quebec - 2026 - Open Source</footer>'
+'</body></html>'
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PAGES
+# ═══════════════════════════════════════════════════════════════════════════
+def page_accueil(user):
+conn = db()
+recipes = conn.execute(
+"SELECT r.*, u.username, u.avatar_emoji FROM recipes r "
+"JOIN users u ON u.id=r.author_id ORDER BY r.updated_at DESC LIMIT 10"
+).fetchall()
+conn.close()
+
+hero = (
+'<div class="hero">'
+'<h1>NEXUS-FOOD</h1>'
+'<p>GitCook.com - Le GitHub des cuisiniers</p>'
+'<p style="font-size:13px;color:var(--muted);font-family:monospace">'
+'Versionne tes recettes. Fork les meilleures. Merge les idees.</p>'
+'</div>'
+)
+
+html = hero
+
+if user:
+html += '<div class="card"><h2>Bienvenue ' + esc(user["username"]) + '</h2>'
+html += '<a href="/create" class="btn">+ Creer une recette</a></div>'
+else:
+html += '<div class="alert info">Connecte-toi pour creer et forker des recettes.</div>'
+
+html += '<h2 style="color:var(--or);margin:24px 0 16px;font-size:20px">Recettes recentes</h2>'
+
+if not recipes:
+html += '<div class="empty"><div class="icon">PAN</div><p>Aucune recette</p></div>'
+else:
+for r in recipes:
+html += '<div class="recipe-card">'
+html += '<h3><a href="/recipe/' + esc(r["slug"]) + '">' + esc(r["name"]) + '</a></h3>'
+html += '<div class="desc">' + esc(r["description"]) + '</div>'
+html += '<div><span class="badge version">v' + esc(r["version"]) + '</span>'
+for tag in json.loads(r["tags"] or "[]")[:3]:
+html += '<span class="badge tag">' + esc(tag) + '</span>'
+html += '</div>'
+html += '<div class="stats">'
+html += '<span>Etoiles : ' + str(r["stars"]) + '</span>'
+html += '<span>Forks : ' + str(r["forks_count"]) + '</span>'
+html += '<span>Par : ' + esc(r["username"]) + '</span>'
+html += '<span>' + esc(r["prep_time"]) + ' min</span>'
+html += '</div></div>'
+
+return layout("Accueil", html, user, "accueil")
+
+
+def page_explore(user):
+conn = db()
+recipes = conn.execute(
+"SELECT r.*, u.username FROM recipes r JOIN users u ON u.id=r.author_id "
+"ORDER BY RANDOM() LIMIT 20"
+).fetchall()
+conn.close()
+
+html = '<h1 style="color:var(--or);margin-bottom:16px">Explorer</h1>'
+html += '<p style="color:var(--dim);margin-bottom:24px">Decouvre des recettes aleatoires</p>'
+
+for r in recipes:
+html += '<div class="recipe-card">'
+html += '<h3><a href="/recipe/' + esc(r["slug"]) + '">' + esc(r["name"]) + '</a></h3>'
+html += '<div class="desc">' + esc(r["description"]) + '</div>'
+html += '<div class="stats">'
+html += '<span>Etoiles : ' + str(r["stars"]) + '</span>'
+html += '<span>Par : ' + esc(r["username"]) + '</span>'
+html += '</div></div>'
+
+return layout("Explorer", html, user, "explore")
+
+
+def page_trending(user):
+conn = db()
+recipes = conn.execute(
+"SELECT r.*, u.username FROM recipes r JOIN users u ON u.id=r.author_id "
+"ORDER BY (r.stars + r.forks_count * 2) DESC LIMIT 10"
+).fetchall()
+conn.close()
+
+html = '<h1 style="color:var(--or);margin-bottom:16px">Tendances</h1>'
+html += '<p style="color:var(--dim);margin-bottom:24px">Classement par popularite</p>'
+
+for i, r in enumerate(recipes, 1):
+score = r["stars"] + r["forks_count"] * 2
+html += '<div class="trend">'
+html += '<div class="rank">#' + str(i) + '</div>'
+html += '<div class="info">'
+html += '<h4><a href="/recipe/' + esc(r["slug"]) + '" style="color:var(--text);text-decoration:none">' + esc(r["name"]) + '</a></h4>'
+html += '<div class="stats">Par ' + esc(r["username"]) + ' - ' + str(r["stars"]) + ' etoiles - ' + str(r["forks_count"]) + ' forks</div>'
+html += '</div>'
+html += '<div class="score">' + str(score) + '</div>'
+html += '</div>'
+
+return layout("Tendances", html, user, "trending")
+
+
+def page_recipe(slug, user):
+conn = db()
+r = conn.execute(
+"SELECT r.*, u.username, u.avatar_emoji, u.id as uid FROM recipes r "
+"JOIN users u ON u.id=r.author_id WHERE r.slug=?", (slug,)
+).fetchone()
+
+if not r:
+conn.close()
+return layout("Introuvable", '<div class="alert error">Recette introuvable</div>', user)
+
+comments = conn.execute(
+"SELECT c.*, u.username FROM comments c JOIN users u ON u.id=c.author_id "
+"WHERE c.recipe_id=? ORDER BY c.created_at DESC", (r["id"],)
+).fetchall()
+
+issues = conn.execute(
+"SELECT i.*, u.username FROM issues i JOIN users u ON u.id=i.author_id "
+"WHERE i.recipe_id=? ORDER BY i.created_at DESC", (r["id"],)
+).fetchall()
+
+prs = conn.execute(
+"SELECT p.*, u.username FROM pull_requests p JOIN users u ON u.id=p.author_id "
+"WHERE p.recipe_id=? ORDER BY p.created_at DESC", (r["id"],)
+).fetchall()
+conn.close()
+
+ingredients = json.loads(r["ingredients"] or "[]")
+steps = json.loads(r["steps"] or "[]")
+tags = json.loads(r["tags"] or "[]")
+
+html = '<div class="card">'
+html += '<h1 style="color:var(--or);font-size:28px;margin-bottom:8px">' + esc(r["name"]) + '</h1>'
+html += '<div style="color:var(--dim);margin-bottom:16px">' + esc(r["description"]) + '</div>'
+html += '<div style="margin-bottom:16px">'
+html += '<span class="badge version">v' + esc(r["version"]) + '</span>'
+for tag in tags:
+html += '<span class="badge tag">' + esc(tag) + '</span>'
+html += '</div>'
+html += '<div style="color:var(--dim);font-size:14px">'
+html += 'Par <strong style="color:var(--cyan)">' + esc(r["username"]) + '</strong> - '
+html += 'Difficulte ' + str(r["difficulty"]) + '/5 - '
+html += str(r["prep_time"]) + ' min - '
+html += str(r["portions"]) + ' portions'
+html += '</div>'
+html += '</div>'
+
+html += '<div class="grid-2">'
+
+# Colonne gauche
+html += '<div>'
+html += '<div class="card">'
+html += '<h2>Ingredients</h2>'
+html += '<ul class="ingredients">'
+for ing in ingredients:
+html += '<li><span>' + esc(ing.get("nom", "?")) + '</span>'
+html += '<span class="qty">' + esc(ing.get("qty", "")) + '</span></li>'
+html += '</ul></div>'
+
+html += '<div class="card">'
+html += '<h2>Etapes</h2>'
+html += '<ol class="steps">'
+for step in steps:
+html += '<li>' + esc(step) + '</li>'
+html += '</ol></div>'
+
+# Issues
+if issues:
+html += '<div class="card"><h2>Issues (' + str(len(issues)) + ')</h2>'
+for i in issues:
+cls = "issue" if i["status"] == "open" else "issue closed"
+html += '<div class="' + cls + '">'
+html += '<div class="title">' + esc(i["title"])
+html += '<span class="label">' + esc(i["label"]) + '</span></div>'
+html += '<div style="color:var(--dim);font-size:13px;margin-top:6px">' + esc(i["description"]) + '</div>'
+html += '<div style="color:var(--muted);font-size:11px;margin-top:6px">Par ' + esc(i["username"]) + '</div>'
+html += '</div>'
+html += '</div>'
+
+# PRs
+if prs:
+html += '<div class="card"><h2>Pull Requests (' + str(len(prs)) + ')</h2>'
+for p in prs:
+cls = "pr merged" if p["status"] == "merged" else "pr"
+html += '<div class="' + cls + '">'
+html += '<div class="title">' + esc(p["title"]) + '</div>'
+html += '<div style="color:var(--dim);font-size:13px;margin-top:6px">' + esc(p["description"]) + '</div>'
+html += '<div class="changes">' + esc(p["changes"]) + '</div>'
+html += '<div style="color:var(--muted);font-size:11px;margin-top:6px">Par ' + esc(p["username"]) + '</div>'
+html += '</div>'
+html += '</div>'
+
+# Commentaires
+html += '<div class="card"><h2>Commentaires (' + str(len(comments)) + ')</h2>'
+if user:
+html += '<form method="POST" action="/recipe/' + esc(slug) + '/comment">'
+html += '<textarea name="content" placeholder="Ton commentaire..." required></textarea>'
+html += '<button type="submit" class="btn">Publier</button>'
+html += '</form>'
+else:
+html += '<div class="alert info">Connecte-toi pour commenter.</div>'
+
+for c in comments:
+html += '<div class="comment">'
+html += '<div class="author">' + esc(c["username"])
+html += '<span class="date">' + esc(c["created_at"][:16]) + '</span></div>'
+html += '<div class="content">' + esc(c["content"]) + '</div>'
+html += '</div>'
+html += '</div>'
+
+html += '</div>' # Fin colonne gauche
+
+# Colonne droite
+html += '<div>'
+html += '<div class="card">'
+html += '<h2>Actions</h2>'
+html += '<p style="color:var(--dim);font-size:13px;margin-bottom:12px">'
+html += 'Etoiles : ' + str(r["stars"]) + '<br>'
+html += 'Forks : ' + str(r["forks_count"]) + '</p>'
+if user:
+html += '<form method="POST" action="/recipe/' + esc(slug) + '/star" style="display:inline">'
+html += '<button type="submit" class="btn">Etoile</button></form>'
+html += '<a href="/fork/' + esc(slug) + '" class="btn secondary">Fork</a>'
+html += '</div>'
+
+if user:
+html += '<div class="card"><h2>Signaler un probleme</h2>'
+html += '<form method="POST" action="/recipe/' + esc(slug) + '/issue">'
+html += '<input name="title" placeholder="Titre" required>'
+html += '<textarea name="description" placeholder="Description"></textarea>'
+html += '<select name="label"><option value="bug">Bug</option>'
+html += '<option value="allergie">Allergie</option>'
+html += '<option value="suggestion">Suggestion</option></select>'
+html += '<button type="submit" class="btn">Creer issue</button>'
+html += '</form></div>'
+
+html += '<div class="card"><h2>Proposer une modif</h2>'
+html += '<form method="POST" action="/recipe/' + esc(slug) + '/pr">'
+html += '<input name="title" placeholder="Titre du PR" required>'
+html += '<textarea name="description" placeholder="Description"></textarea>'
+html += '<textarea name="changes" placeholder="Changements (ingredients, etapes)"></textarea>'
+html += '<button type="submit" class="btn">Soumettre PR</button>'
+html += '</form></div>'
+
+html += '</div></div>' # Fin grid
+
+return layout(r["name"], html, user)
+
+
+def page_create(user):
+if not user:
+return layout("Login requis",
+'<div class="alert error">Connecte-toi pour creer une recette. '
+'<a href="/login" style="color:var(--info)">Login</a></div>', user)
+
+html = '<div class="card">'
+html += '<h1 style="color:var(--or);margin-bottom:16px">Creer une recette</h1>'
+html += '<form method="POST" action="/create">'
+html += '<label>Nom de la recette</label>'
+html += '<input name="name" required placeholder="Ex: Burger Quantique">'
+html += '<label>Description</label>'
+html += '<textarea name="description" placeholder="Decris ta recette..."></textarea>'
+html += '<label>Difficulte (1-5)</label>'
+html += '<input type="number" name="difficulty" value="3" min="1" max="5">'
+html += '<label>Temps de preparation (min)</label>'
+html += '<input type="number" name="prep_time" value="30" min="1">'
+html += '<label>Portions</label>'
+html += '<input type="number" name="portions" value="4" min="1">'
+html += '<label>Ingredients (un par ligne, format: nom | quantite)</label>'
+html += '<textarea name="ingredients" placeholder="Poulet | 150g&#10;Pain | 1&#10;Cheddar | 2 tr."></textarea>'
+html += '<label>Etapes (une par ligne)</label>'
+html += '<textarea name="steps" placeholder="Préchauffer four&#10;Paner le poulet&#10;Frire 5 min"></textarea>'
+html += '<label>Tags (separes par virgule)</label>'
+html += '<input name="tags" placeholder="burger, poulet, epice">'
+html += '<button type="submit" class="btn">Creer la recette</button>'
+html += '</form></div>'
+
+return layout("Creer", html, user, "create")
+
+
+def page_fork(slug, user):
+if not user:
+return layout("Login requis",
+'<div class="alert error">Connecte-toi pour forker.</div>', user)
+
+conn = db()
+r = conn.execute("SELECT * FROM recipes WHERE slug=?", (slug,)).fetchone()
+if not r:
+conn.close()
+return layout("Introuvable", '<div class="alert error">Recette introuvable</div>', user)
+
+ingredients = json.loads(r["ingredients"] or "[]")
+steps = json.loads(r["steps"] or "[]")
+tags = json.loads(r["tags"] or "[]")
+conn.close()
+
+html = '<div class="card">'
+html += '<h1 style="color:var(--or);margin-bottom:8px">Fork : ' + esc(r["name"]) + '</h1>'
+html += '<p style="color:var(--dim);margin-bottom:16px">Cree ta version modifiee.</p>'
+html += '<form method="POST" action="/fork/' + esc(slug) + '">'
+html += '<label>Nouveau nom</label>'
+html += '<input name="name" value="' + esc(r["name"]) + '-fork" required>'
+html += '<label>Description</label>'
+html += '<textarea name="description">' + esc(r["description"]) + '</textarea>'
+html += '<label>Ingredients (format: nom | quantite)</label>'
+ing_text = "\n".join(esc(i.get("nom", "")) + " | " + esc(i.get("qty", "")) for i in ingredients)
+html += '<textarea name="ingredients" rows="8">' + ing_text + '</textarea>'
+html += '<label>Etapes</label>'
+html += '<textarea name="steps" rows="8">' + "\n".join(esc(s) for s in steps) + '</textarea>'
+html += '<label>Tags</label>'
+html += '<input name="tags" value="' + esc(", ".join(tags)) + '">'
+html += '<button type="submit" class="btn">Forker</button>'
+html += '</form></div>'
+
+return layout("Fork " + r["name"], html, user)
+
+
+def page_profil(username, user):
+conn = db()
+u = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+if not u:
+conn.close()
+return layout("Introuvable", '<div class="alert error">Utilisateur introuvable</div>', user)
+
+recipes = conn.execute(
+"SELECT * FROM recipes WHERE author_id=? ORDER BY updated_at DESC", (u["id"],)
+).fetchall()
+conn.close()
+
+html = '<div class="card">'
+html += '<div style="display:flex;align-items:center;gap:16px">'
+html += '<div class="avatar" style="width:64px;height:64px;font-size:24px">'
+html += esc(u["avatar_emoji"]) + '</div>'
+html += '<div>'
+html += '<h1 style="color:var(--or);font-size:24px">' + esc(u["username"]) + '</h1>'
+html += '<p style="color:var(--dim)">' + esc(u["bio"]) + '</p>'
+html += '<p style="color:var(--muted);font-size:12px;margin-top:6px">'
+html += 'Membre depuis ' + esc(u["created_at"][:10])
+html += '</p></div></div></div>'
+
+html += '<h2 style="color:var(--or);margin:24px 0 16px">Recettes (' + str(len(recipes)) + ')</h2>'
+
+for r in recipes:
+html += '<div class="recipe-card">'
+html += '<h3><a href="/recipe/' + esc(r["slug"]) + '">' + esc(r["name"]) + '</a></h3>'
+html += '<div class="desc">' + esc(r["description"]) + '</div>'
+html += '<div class="stats">'
+html += '<span>Etoiles : ' + str(r["stars"]) + '</span>'
+html += '<span>Forks : ' + str(r["forks_count"]) + '</span>'
+html += '</div></div>'
+
+return layout(u["username"], html, user)
+
+
+def page_issues(user):
+conn = db()
+issues = conn.execute(
+"SELECT i.*, u.username, r.name as recipe_name, r.slug as recipe_slug "
+"FROM issues i JOIN users u ON u.id=i.author_id "
+"JOIN recipes r ON r.id=i.recipe_id "
+"ORDER BY i.created_at DESC LIMIT 50"
+).fetchall()
+conn.close()
+
+html = '<h1 style="color:var(--or);margin-bottom:16px">Issues</h1>'
+html += '<p style="color:var(--dim);margin-bottom:24px">Tous les problemes signales</p>'
+
+if not issues:
+html += '<div class="empty"><div class="icon">OK</div><p>Aucune issue</p></div>'
+else:
+for i in issues:
+cls = "issue" if i["status"] == "open" else "issue closed"
+html += '<div class="' + cls + '">'
+html += '<div class="title">' + esc(i["title"])
+html += '<span class="label">' + esc(i["label"]) + '</span></div>'
+html += '<div style="color:var(--dim);font-size:13px;margin-top:6px">' + esc(i["description"]) + '</div>'
+html += '<div style="color:var(--muted);font-size:12px;margin-top:6px">'
+html += 'Recette : <a href="/recipe/' + esc(i["recipe_slug"]) + '" style="color:var(--cyan)">'
+html += esc(i["recipe_name"]) + '</a> - Par ' + esc(i["username"]) + '</div>'
+html += '</div>'
+
+return layout("Issues", html, user, "issues")
+
+
+def page_pulls(user):
+conn = db()
+prs = conn.execute(
+"SELECT p.*, u.username, r.name as recipe_name, r.slug as recipe_slug "
+"FROM pull_requests p JOIN users u ON u.id=p.author_id "
+"JOIN recipes r ON r.id=p.recipe_id "
+"ORDER BY p.created_at DESC LIMIT 50"
+).fetchall()
+conn.close()
+
+html = '<h1 style="color:var(--or);margin-bottom:16px">Pull Requests</h1>'
+html += '<p style="color:var(--dim);margin-bottom:24px">Toutes les propositions de modif</p>'
+
+if not prs:
+html += '<div class="empty"><div class="icon">PR</div><p>Aucun PR</p></div>'
+else:
+for p in prs:
+cls = "pr merged" if p["status"] == "merged" else "pr"
+html += '<div class="' + cls + '">'
+html += '<div class="title">' + esc(p["title"])
+if p["status"] == "merged":
+html += '<span class="badge success" style="margin-left:8px">merged</span>'
+html += '</div>'
+html += '<div style="color:var(--dim);font-size:13px;margin-top:6px">' + esc(p["description"]) + '</div>'
+if p["changes"]:
+html += '<div class="changes">' + esc(p["changes"]) + '</div>'
+html += '<div style="color:var(--muted);font-size:12px;margin-top:6px">'
+html += 'Recette : <a href="/recipe/' + esc(p["recipe_slug"]) + '" style="color:var(--cyan)">'
+html += esc(p["recipe_name"]) + '</a> - Par ' + esc(p["username"]) + '</div>'
+html += '</div>'
+
+return layout("Pull Requests", html, user, "pulls")
+
+
+def page_login(error=""):
+html = '<div class="card" style="max-width:400px;margin:40px auto">'
+html += '<h1 style="color:var(--or);margin-bottom:16px">Connexion</h1>'
+if error:
+html += '<div class="alert error">' + esc(error) + '</div>'
+html += '<form method="POST" action="/login">'
+html += '<label>Nom d utilisateur</label>'
+html += '<input name="username" required>'
+html += '<label>Mot de passe</label>'
+html += '<input type="password" name="password" required>'
+html += '<button type="submit" class="btn">Se connecter</button>'
+html += '</form>'
+html += '<p style="color:var(--dim);margin-top:16px;text-align:center">'
+html += 'Pas de compte ? <a href="/register" style="color:var(--cyan)">Inscris-toi</a></p>'
+html += '</div>'
+return layout("Login", html)
+
+
+def page_register(error=""):
+html = '<div class="card" style="max-width:400px;margin:40px auto">'
+html += '<h1 style="color:var(--or);margin-bottom:16px">Inscription</h1>'
+if error:
+html += '<div class="alert error">' + esc(error) + '</div>'
+html += '<form method="POST" action="/register">'
+html += '<label>Nom d utilisateur</label>'
+html += '<input name="username" required minlength="3">'
+html += '<label>Email</label>'
+html += '<input type="email" name="email" required>'
+html += '<label>Mot de passe (min 6)</label>'
+html += '<input type="password" name="password" required minlength="6">'
+html += '<label>Bio</label>'
+html += '<textarea name="bio"></textarea>'
+html += '<button type="submit" class="btn">S inscrire</button>'
+html += '</form>'
+html += '<p style="color:var(--dim);margin-top:16px;text-align:center">'
+html += 'Deja un compte ? <a href="/login" style="color:var(--cyan)">Connecte-toi</a></p>'
+html += '</div>'
+return layout("Inscription", html)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HTTP HANDLER
+# ═══════════════════════════════════════════════════════════════════════════
+class Handler(http.server.BaseHTTPRequestHandler):
+
+def log_message(self, *a):
+pass
+
+def _send(self, code, body, ctype="text/html; charset=utf-8", cookies=None):
+if isinstance(body, str):
+body = body.encode("utf-8")
+self.send_response(code)
+self.send_header("Content-Type", ctype)
+self.send_header("Content-Length", str(len(body)))
+if cookies:
+for c in cookies:
+self.send_header("Set-Cookie", c)
+self.end_headers()
+try:
+self.wfile.write(body)
+except Exception:
+pass
+
+def _redirect(self, url, cookies=None):
+self.send_response(302)
+self.send_header("Location", url)
+if cookies:
+for c in cookies:
+self.send_header("Set-Cookie", c)
+self.end_headers()
+
+def _user(self):
+cookies = parse_cookies(self.headers.get("Cookie", ""))
+token = cookies.get("session")
+return get_user_from_session(token)
+
+def _read_post(self):
+try:
+n = int(self.headers.get("Content-Length", 0))
+body = self.rfile.read(n).decode("utf-8") if n else ""
+return urllib.parse.parse_qs(body)
+except Exception:
+return {}
+
+def do_GET(self):
+path = urllib.parse.urlparse(self.path).path
+user = self._user()
+
+try:
+if path == "/":
+self._send(200, page_accueil(user))
+elif path == "/explore":
+self._send(200, page_explore(user))
+elif path == "/trending":
+self._send(200, page_trending(user))
+elif path == "/create":
+self._send(200, page_create(user))
+elif path == "/issues":
+self._send(200, page_issues(user))
+elif path == "/pulls":
+self._send(200, page_pulls(user))
+elif path == "/login":
+self._send(200, page_login())
+elif path == "/register":
+self._send(200, page_register())
+elif path == "/logout":
+self._redirect("/", cookies=["session=; Path=/; Max-Age=0"])
+elif path.startswith("/recipe/"):
+slug = path[8:]
+self._send(200, page_recipe(slug, user))
+elif path.startswith("/profil/"):
+username = path[8:]
+self._send(200, page_profil(username, user))
+elif path.startswith("/fork/"):
+slug = path[6:]
+self._send(200, page_fork(slug, user))
+else:
+self._send(404, layout("404", '<div class="alert error">Page introuvable</div>', user))
+except Exception as e:
+self._send(500, layout("Erreur", '<div class="alert error">Erreur : ' + esc(str(e)) + '</div>', user))
+
+def do_POST(self):
+path = urllib.parse.urlparse(self.path).path
+data = self._read_post()
+user = self._user()
+
+def get(key):
+return data.get(key, [""])[0].strip()
+
+try:
+# LOGIN
+if path == "/login":
+username = get("username")
+password = get("password")
+conn = db()
+u = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+conn.close()
+if u and verify_password(password, u["password_hash"]):
+token = create_session(u["id"])
+self._redirect("/", cookies=["session=" + token + "; Path=/; Max-Age=2592000"])
+else:
+self._send(200, page_login("Identifiants invalides"))
+
+# REGISTER
+elif path == "/register":
+username = get("username")
+email = get("email")
+password = get("password")
+bio = get("bio")
+if len(username) < 3 or len(password) < 6:
+self._send(200, page_register("Nom (3+) ou mot de passe (6+) trop court"))
+return
+conn = db()
+try:
+cur = conn.execute(
+"INSERT INTO users (username, email, password_hash, bio, created_at) "
+"VALUES (?,?,?,?,?)",
+(username, email, hash_password(password), bio, datetime.now().isoformat())
+)
+uid = cur.lastrowid
+conn.commit()
+token = create_session(uid)
+conn.close()
+self._redirect("/", cookies=["session=" + token + "; Path=/; Max-Age=2592000"])
+except sqlite3.IntegrityError:
+conn.close()
+self._send(200, page_register("Nom ou email deja pris"))
+
+# CREATE RECIPE
+elif path == "/create":
+if not user:
+self._redirect("/login")
+return
+name = get("name")
+description = get("description")
+difficulty = int(get("difficulty") or 3)
+prep_time = int(get("prep_time") or 30)
+portions = int(get("portions") or 4)
+ing_raw = get("ingredients")
+steps_raw = get("steps")
+tags_raw = get("tags")
+
+ingredients = []
+for line in ing_raw.split("\n"):
+line = line.strip()
+if "|" in line:
+parts = line.split("|", 1)
+ingredients.append({"nom": parts[0].strip(), "qty": parts[1].strip()})
+elif line:
+ingredients.append({"nom": line, "qty": ""})
+
+steps = [s.strip() for s in steps_raw.split("\n") if s.strip()]
+tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+
+slug_base = slugify(name)
+slug = slug_base
+conn = db()
+i = 1
+while conn.execute("SELECT id FROM recipes WHERE slug=?", (slug,)).fetchone():
+slug = slug_base + "-" + str(i)
+i += 1
+
+conn.execute(
+"INSERT INTO recipes (author_id, name, slug, description, difficulty, "
+"prep_time, portions, ingredients, steps, tags, created_at, updated_at) "
+"VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+(user["id"], name, slug, description, difficulty, prep_time, portions,
+json.dumps(ingredients, ensure_ascii=False),
+json.dumps(steps, ensure_ascii=False),
+json.dumps(tags, ensure_ascii=False),
+datetime.now().isoformat(), datetime.now().isoformat())
+)
+conn.commit()
+conn.close()
+self._redirect("/recipe/" + slug)
+
+# STAR
+elif path.startswith("/recipe/") and path.endswith("/star"):
+if not user:
+self._redirect("/login")
+return
+slug = path[8:-5]
+conn = db()
+conn.execute("UPDATE recipes SET stars = stars + 1 WHERE slug=?", (slug,))
+conn.commit()
+conn.close()
+self._redirect("/recipe/" + slug)
+
+# COMMENT
+elif path.startswith("/recipe/") and path.endswith("/comment"):
+if not user:
+self._redirect("/login")
+return
+slug = path[8:-8]
+content = get("content")
+if content:
+conn = db()
+r = conn.execute("SELECT id FROM recipes WHERE slug=?", (slug,)).fetchone()
+if r:
+conn.execute(
+"INSERT INTO comments (recipe_id, author_id, content, created_at) "
+"VALUES (?,?,?,?)",
+(r["id"], user["id"], content, datetime.now().isoformat())
+)
+conn.commit()
+conn.close()
+self._redirect("/recipe/" + slug)
+
+# ISSUE
+elif path.startswith("/recipe/") and path.endswith("/issue"):
+if not user:
+self._redirect("/login")
+return
+slug = path[8:-6]
+title = get("title")
+description = get("description")
+label = get("label") or "bug"
+if title:
+conn = db()
+r = conn.execute("SELECT id FROM recipes WHERE slug=?", (slug,)).fetchone()
+if r:
+conn.execute(
+"INSERT INTO issues (recipe_id, author_id, title, description, label, created_at) "
+"VALUES (?,?,?,?,?,?)",
+(r["id"], user["id"], title, description, label, datetime.now().isoformat())
+)
+conn.commit()
+conn.close()
+self._redirect("/recipe/" + slug)
+
+# PR
+elif path.startswith("/recipe/") and path.endswith("/pr"):
+if not user:
+self._redirect("/login")
+return
+slug = path[8:-3]
+title = get("title")
+description = get("description")
+changes = get("changes")
+if title:
+conn = db()
+r = conn.execute("SELECT id FROM recipes WHERE slug=?", (slug,)).fetchone()
+if r:
+conn.execute(
+"INSERT INTO pull_requests (recipe_id, author_id, title, description, changes, created_at) "
+"VALUES (?,?,?,?,?,?)",
+(r["id"], user["id"], title, description, changes, datetime.now().isoformat())
+)
+conn.commit()
+conn.close()
+self._redirect("/recipe/" + slug)
+
+# FORK
+elif path.startswith("/fork/"):
+if not user:
+self._redirect("/login")
+return
+slug = path[6:]
+name = get("name")
+description = get("description")
+ing_raw = get("ingredients")
+steps_raw = get("steps")
+tags_raw = get("tags")
+
+ingredients = []
+for line in ing_raw.split("\n"):
+line = line.strip()
+if "|" in line:
+parts = line.split("|", 1)
+ingredients.append({"nom": parts[0].strip(), "qty": parts[1].strip()})
+elif line:
+ingredients.append({"nom": line, "qty": ""})
+
+steps = [s.strip() for s in steps_raw.split("\n") if s.strip()]
+tags = [t.strip() for t in tags_raw.split(",") if t.strip()]
+
+new_slug_base = slugify(name)
+new_slug = new_slug_base
+conn = db()
+i = 1
+while conn.execute("SELECT id FROM recipes WHERE slug=?", (new_slug,)).fetchone():
+new_slug = new_slug_base + "-" + str(i)
+i += 1
+
+conn.execute(
+"INSERT INTO recipes (author_id, name, slug, description, "
+"prep_time, portions, ingredients, steps, tags, created_at, updated_at) "
+"VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+(user["id"], name, new_slug, description, 30, 4,
+json.dumps(ingredients, ensure_ascii=False),
+json.dumps(steps, ensure_ascii=False),
+json.dumps(tags, ensure_ascii=False),
+datetime.now().isoformat(), datetime.now().isoformat())
+)
+conn.execute("UPDATE recipes SET forks_count = forks_count + 1 WHERE slug=?", (slug,))
+conn.commit()
+conn.close()
+self._redirect("/recipe/" + new_slug)
+
+else:
+self._send(404, "Not found")
+
+except Exception as e:
+self._send(500, layout("Erreur", '<div class="alert error">Erreur : ' + esc(str(e)) + '</div>', user))
+
+
+class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+daemon_threads = True
+allow_reuse_address = True
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
+def main():
+print()
+print("╔═══════════════════════════════════════════════════════════════╗")
+print("║ NEXUS-FOOD v" + VERSION + " ║")
+print("║ GitCook.com - GitHub pour les cuisiniers ║")
+print("║ Auteur : " + AUTEUR + " ║")
+print("║ Port : " + str(PORT) + " ║")
+print("╚═══════════════════════════════════════════════════════════════╝")
+print()
+
+init_db()
+init_demo()
+
+print()
+print(" [OK] Serveur : http://localhost:" + str(PORT) + "/")
+print(" [OK] Comptes demo :")
+print(" - DGK / nexus2026")
+print(" - Redman / piment2026")
+print(" - ChefMarie / cuisine2026")
+print(" - TacosKing / tacos2026")
+print()
+print(" [OK] Ctrl+C pour arreter")
+print()
+
+try:
+server = Server((HOST, PORT), Handler)
+server.serve_forever()
+except KeyboardInterrupt:
+print("\n Arrete.")
+except OSError as e:
+print(" Erreur port " + str(PORT) + " : " + str(e))
+sys.exit(1)
+
+
+if __name__ == "__main__":
+main()
