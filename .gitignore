@@ -16,3 +16,181 @@ bin-release/
 # Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
 # should NOT be excluded as they contain compiler settings and other important
 # information for Eclipse / Flash Builder.
+```gitignore
+# ═══════════════════════════════════════════════════════════════════════════
+# NEXUS-FOOD - .gitignore
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ─── Base de données SQLite ───
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+gitcock.db*
+
+# ─── Logs ───
+*.log
+logs/
+studio.log
+
+# ─── Python ───
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ─── Environnements virtuels ───
+venv/
+.venv/
+ENV/
+env/
+.python-version
+
+# ─── IDE ───
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+.project
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# ─── OS ───
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# ─── Fichiers temporaires ───
+tmp/
+temp/
+*.tmp
+*.bak
+*.backup
+*.old
+*.orig
+*~
+
+# ─── Secrets / Config locale ───
+.env
+.env.local
+.env.*.local
+secrets/
+*.pem
+*.key
+*.crt
+*.cert
+config.local.json
+config.private.json
+
+# ─── Cache ───
+.cache/
+.cache*/
+*.cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# ─── Node (si usage futur) ───
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# ─── Rust (si usage futur) ───
+target/
+Cargo.lock
+
+# ─── Fichiers de test / démo ───
+test_*.db
+demo_*.db
+*.test
+*.demo
+
+# ─── Sessions et utilisateurs ───
+sessions/
+users.json
+preferences.json
+
+# ─── Données spécifiques au projet ───
+projects/
+reports/
+backups/
+checkpoints/
+tiers/
+
+# ─── Fichiers personnels ───
+personal/
+private/
+*.personal
+
+# ─── Fichiers de verrouillage ───
+*.lock
+.lock
+!package-lock.json
+!Cargo.lock
+
+# ─── Captures d'écran et docs générés ───
+screenshots/
+*.screenshot.png
+docs/generated/
+```
+
+---
+
+3. Comment poster sur GitHub
+
+Étape 1 — Initialise Git dans ton dossier :
+
+```bash
+cd ~/nexus_food
+git init
+git add .
+git commit -m "feat: NEXUS-FOOD v1.0.0 - GitCook.com"
+```
+
+Étape 2 — Crée le repo sur GitHub :
+
+1. Va sur https://github.com/new
+2. Nom : nexus-food
+3. Description : GitCook.com — GitHub pour les cuisiniers
+4. Public
+5. Ne coche PAS "Initialize with README" (tu en as déjà un)
+6. Clique "Create repository"
+
+Étape 3 — Lie ton dossier local au repo distant :
+
+```bash
+git remote add origin https://github.com/Aissamohammedi88/nexus-food.git
+git branch -M main
+git push -u origin main
+```
